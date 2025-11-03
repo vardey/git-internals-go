@@ -11,6 +11,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 )
 
@@ -20,7 +22,7 @@ const nullOperator string = "\x00"
 // Info holds the metadata for a file or directory.
 type Info struct {
 	Size      int      // Size of the file in bytes (0 for directories)
-	FileMode  int      // File permissions and mode
+	FileMode  string   // File permissions and mode
 	HashBytes [20]byte // Content hash (20 bytes, e.g., SHA-1), initially empty
 	IsDir     bool     // True if it is a directory, false if it is a file
 }
@@ -38,15 +40,20 @@ type Tree struct {
 	Root *Node
 }
 
+type TreeEntry struct {
+	Name   string        // name of file or dir
+	Buffer *bytes.Buffer // The data
+}
+
 // NewTree initializes a new Tree with a root directory.
 func NewTree(srcDir string) *Tree {
 	// The root node is always a directory and has no name in the context of the path.
-	root := NewNode(srcDir, true, 0, 040000, nil)
+	root := NewNode(srcDir, true, 0, "040000", nil)
 	return &Tree{Root: root}
 }
 
 // NewNode is a constructor for creating a new Node.
-func NewNode(name string, isDir bool, size int, mode int, parent *Node) *Node {
+func NewNode(name string, isDir bool, size int, mode string, parent *Node) *Node {
 	// Only files should have a non-zero size.
 	if isDir {
 		size = 0
@@ -92,7 +99,7 @@ func gitObjReaderHelper(inputSha string) []byte {
 
 // Insert inserts a new file or directory into the tree based on its full path.
 // It creates any necessary parent directories along the way.
-func (t *Tree) Insert(fullPath string, isDir bool, size int, mode int) (*Node, error) {
+func (t *Tree) Insert(fullPath string, isDir bool, size int, mode string) (*Node, error) {
 	// Clean the path to handle redundancies like 'a//b' and resolve '.' and '..'
 	// and trim leading/trailing separators so Split works cleanly.
 	cleanedPath := filepath.Clean(fullPath)
@@ -128,15 +135,17 @@ func (t *Tree) Insert(fullPath string, isDir bool, size int, mode int) (*Node, e
 				// This is the final file/directory being inserted
 				newNode = NewNode(name, isDir, size, mode, currentNode)
 
-				// New logic: Calculate hash for files using the parent directory's path
+				//Calculate hash for files using the parent directory's path
 				if !isDir {
-					fileBytes, err := os.ReadFile(os.Args[3])
+					fileBytes, err := os.ReadFile(cleanedPath)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Error reading file: %s\n", err)
 						return nil, err
 					}
 					// Use filepath.Dir to get the parent directory path from the cleaned path
 					newNode.Info.HashBytes = hashObject("blob", fileBytes)
+				} else {
+					newNode.Info.HashBytes = hashObject("tree", []byte{})
 				}
 			} else {
 				// Intermediate node must be a directory
@@ -152,15 +161,15 @@ func (t *Tree) Insert(fullPath string, isDir bool, size int, mode int) (*Node, e
 }
 
 // getGitMode determines the 6-digit Git mode string for a given file entry.
-func getGitObjectMode(d fs.DirEntry) (int, error) {
+func getGitObjectMode(d fs.DirEntry) (string, error) {
 	// 1. Check for Directory
 	if d.IsDir() {
-		return 040000, nil // Git mode for a tree object (directory)
+		return "040000", nil // Git mode for a tree object (directory)
 	}
 
 	// 2. Check for Symbolic Link
 	if d.Type()&fs.ModeSymlink != 0 {
-		return 120000, nil // Git mode for a symbolic link
+		return "120000", nil // Git mode for a symbolic link
 	}
 
 	// 3. Handle Regular Files (Blob Objects)
@@ -168,21 +177,21 @@ func getGitObjectMode(d fs.DirEntry) (int, error) {
 		// Need full os.FileInfo to check for the executable bit
 		info, err := d.Info()
 		if err != nil {
-			return 0, err
+			return "", err
 		}
 
 		// Check the executable bit:
 		// 0111 (octal) represents the executable bits (user, group, other)
 		// If ANY of the executable bits are set, Git treats it as an executable file.
 		if info.Mode()&0111 != 0 {
-			return 100755, nil // Executable file
+			return "100755", nil // Executable file
 		}
 
-		return 100644, nil // Non-executable file
+		return "100644", nil // Non-executable file
 	}
 
 	// For any other special file types (like devices, sockets, etc.), Git ignores them
-	return 0, fmt.Errorf("unsupported file type for Git: %s", d.Type().String())
+	return "", fmt.Errorf("unsupported file type for Git: %s", d.Type().String())
 }
 
 func catFile(inputSha string) {
@@ -225,7 +234,7 @@ func hashObject(objectType string, fileBytes []byte) [20]byte {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("%s", contentHexString)
+	// fmt.Printf("%s", contentHexString)
 	return contentBytes
 }
 
@@ -247,14 +256,90 @@ func lsTree(inputSha string) {
 	os.Exit(0)
 }
 
-/*
-header\0blobObject(src.txt)\0treeObject(subsrc)
+// iterative postorder traversal using the two-stack method
+func (t *Tree) PostOrderTraversal() []*Node {
+	if t.Root == nil {
+		return nil
+	}
 
-treeObject(subsrc) =
-*/
-func writeTree() {
-	srcDir := "./app" //objectsDir
-	err := filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
+	// Stack 1 (S1): Used for the modified Preorder traversal.
+	stack1 := []*Node{t.Root}
+
+	// Result slice: Stores the nodes in reverse postorder (Root -> Children_k -> ... -> Children_1).
+	var result []*Node
+
+	for len(stack1) > 0 {
+		// 1. Pop the node from S1 (Peek and Pop combined)
+		n := stack1[len(stack1)-1]
+		stack1 = stack1[:len(stack1)-1]
+
+		// 2. Add the node's value to the result slice (acting as Stack 2)
+		result = append(result, n)
+
+		// 3. Push all children onto S1 from LEFT-TO-RIGHT.
+		// Since the stack is LIFO, this ensures they are processed Right-to-Left later.
+		for _, child := range n.Children {
+			if child != nil {
+				stack1 = append(stack1, child)
+			}
+		}
+	}
+
+	// 4. Reverse the result slice to get the correct Postorder sequence
+	// (Children_1 -> ... -> Children_k -> Root).
+	slices.Reverse(result)
+
+	return result
+}
+
+func NewTreeEntry(node *Node) *TreeEntry {
+	objectBytes := new(bytes.Buffer)
+	objectBytes.WriteString(node.Info.FileMode)
+	objectBytes.WriteByte(' ')
+	objectBytes.WriteString(node.Name)
+	objectBytes.WriteByte(0)
+	objectBytes.Write(node.Info.HashBytes[:])
+	return &TreeEntry{Name: node.Name, Buffer: objectBytes}
+}
+
+func concatenateTreeEntries(treeEntries []*TreeEntry) ([]byte, error) {
+	// 1. Calculate the total size required for the destination slice
+	totalSize := 0
+	for _, entry := range treeEntries {
+		totalSize += entry.Buffer.Len()
+	}
+
+	// 2. Pre-allocate the final byte slice with the exact total size
+	finalBytes := make([]byte, totalSize)
+
+	// 3. Copy data from all entry buffers into the final slice
+	offset := 0
+	for _, entry := range treeEntries {
+
+		// Get the underlying byte slice from the entry's buffer
+		srcData := entry.Buffer.Bytes()
+		dataLen := len(srcData)
+
+		// Copy the source data into the correct location in the destination slice
+		n := copy(finalBytes[offset:offset+dataLen], srcData)
+
+		// This error check is mostly theoretical for simple memory copies
+		if n != dataLen {
+			// This would only happen if the copy was unexpectedly incomplete
+			return nil, fmt.Errorf("failed to copy all bytes for entry: %s", entry.Name)
+		}
+
+		// Advance the offset for the next copy operation
+		offset += n
+	}
+
+	// 4. Return the complete, pre-allocated slice
+	return finalBytes, nil
+}
+
+func writeTree(sourceDir string) {
+	tree := NewTree(sourceDir)
+	err := filepath.WalkDir(sourceDir, func(path string, d fs.DirEntry, err error) error {
 
 		if d.Name() == ".git" {
 			return filepath.SkipDir
@@ -270,21 +355,69 @@ func writeTree() {
 			fmt.Println(errr)
 			return errr
 		}
-		fmt.Println("path: ", path, " name: ", d.Name(), "directory?", d.IsDir(), "gitObjMode: ", gitObjectMode, "file size: ", fileInfo.Size(), "+++++++")
+		_, er := tree.Insert(path, d.IsDir(), int(fileInfo.Size()), gitObjectMode)
+		// fmt.Println("node: ", node)
+
+		if er != nil {
+			fmt.Println(er)
+			return er
+		}
+
 		return nil
 	})
 	if err != nil {
 		log.Fatalf("impossible to walk directories: %s", err)
 	}
+
+	listOfNodes := tree.PostOrderTraversal()
+	// fmt.Println("listOfNodes", listOfNodes)
+
+	i := 0
+	for i < len(listOfNodes) {
+
+		currentNode := listOfNodes[i]
+		parentNode := currentNode.Parent
+		j := i
+		var treeEntries []*TreeEntry
+		for j < len(listOfNodes) && currentNode.Parent == listOfNodes[j].Parent && parentNode != nil {
+			treeEntries = append(treeEntries, NewTreeEntry(listOfNodes[j]))
+			j++
+		}
+		childrenNodes := currentNode.Children
+		if parentNode == nil {
+			for _, childNode := range childrenNodes {
+				treeEntries = append(treeEntries, NewTreeEntry(childNode))
+			}
+
+		}
+		// fmt.Println("TreeEntries", treeEntries)
+		sort.Slice(treeEntries, func(i, j int) bool {
+			// This sorts the entries alphabetically by Name
+			return treeEntries[i].Name < treeEntries[j].Name
+		})
+		// create a hashed tree object for the currentNode.parent with treeEntries as the content
+		contentBytes, err := concatenateTreeEntries(treeEntries)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if parentNode != nil {
+			currentNode.Parent.Info.HashBytes = hashObject("tree", contentBytes)
+		}
+
+		i = j
+		if parentNode == nil {
+			break
+		}
+
+	}
+
+	fmt.Fprintf(os.Stderr, "%s", hex.EncodeToString(tree.Root.Info.HashBytes[:]))
 }
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Fprintf(os.Stderr, "Logs from your program will appear here!\n")
-
-	writeTree()
-
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "usage: mygit <command> [<args>...]\n")
 		os.Exit(1)
@@ -333,26 +466,7 @@ func main() {
 		lsTree(os.Args[3])
 
 	case "write-tree":
-		/*
-			create a Tree with "." dir,
-			Traverse the root in such a way that:
-			from the leaf nodes to the top root node follow:
-			at each depth create a new string array "entries"
-			for leaf nodes:
-			if file-> entries.append("node.mode node.name\x00node.hashBytes")
-			else
-			contents=("tree 0\x00") in bytes array
-			node.hashBytes = hashObject("tree", contents)
-			entries.append("node.mode node.name\x00node.hashBytes")
-
-			for parent node:
-			sort the entries array on the basis of node.name in each string
-			entriesString = string(entries)
-			contents = ("tree %d\x00%s", len(entriesString), entryString)
-			hashBytes:=hashObject("tree", contents)
-			since it is a new depth this we need to create a new entries array and append("mode name\x00hashBytes")
-		*/
-		writeTree()
-
+		writeTree(".")
+		os.Exit(0)
 	}
 }
