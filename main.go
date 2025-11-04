@@ -14,10 +14,13 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 )
 
 const objectsDir string = ".git/objects/"
 const nullOperator string = "\x00"
+const authorString string = "Kunal Vardey <vardeyk@gmail.com>"
+const committerString string = "Kunal Vardey <vardeyk@gmail.com>"
 
 // Info holds the metadata for a file or directory.
 type Info struct {
@@ -273,11 +276,17 @@ func lsTree(inputSha string) {
 
 	parts := bytes.Split(contentBytes, []byte(nullOperator))
 	newParts := parts[:len(parts)-1] //removing last sha
-	// fmt.Println("newParts: ", newParts)
+	// for _, part := range newParts {
+	// 	fmt.Println(string(part))
+	// }
 	for i := range newParts {
 		splittedEntry := bytes.Split(newParts[i], []byte(" "))
 		// fmt.Printf("splittedEntry: %v\n", splittedEntry)
-		fmt.Println(string(splittedEntry[1]))
+		// for j := range splittedEntry {
+		// 	fmt.Printf("splittedEntry[%d]: %s\n", j, string(splittedEntry[j]))
+		// }
+		// this will ensure to get the name of the file/dir even when there are spaces in the sha bytes
+		fmt.Println(string(splittedEntry[len(splittedEntry)-1]))
 	}
 	os.Exit(0)
 }
@@ -469,6 +478,18 @@ func writeTree(sourceDir string) {
 	fmt.Fprintf(os.Stdout, "%s", hex.EncodeToString(tree.Root.Info.HashBytes[:]))
 }
 
+func commitTree(treeSha string, parentCommitSha string, commitMessage string) [20]byte {
+	objectBytes := new(bytes.Buffer)
+	fmt.Fprintf(objectBytes, "tree %s\n", treeSha)
+	fmt.Fprintf(objectBytes, "parent %s\n", parentCommitSha)
+	t := time.Now()
+	fmt.Fprintf(objectBytes, "author %s %d %s\n", authorString, t.Unix(), t.Format("-0700"))
+	fmt.Fprintf(objectBytes, "committer %s %d %s\n", committerString, t.Unix(), t.Format("-0700"))
+	fmt.Fprintf(objectBytes, "\n%s\n", commitMessage)
+
+	return hashObject("commit", objectBytes.Bytes())
+}
+
 // Usage: your_program.sh <command> <arg1> <arg2> ...
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -518,6 +539,13 @@ func main() {
 
 	case "write-tree":
 		writeTree(".")
+		os.Exit(0)
+	case "commit-tree":
+		// os.Args[2] == "<tree_sha>"
+		// os.Args[4] == "<parent_commit_sha>"
+		// os.Args[6] == "<commit_message>"
+		hashBytes := commitTree(os.Args[2], os.Args[4], os.Args[6])
+		fmt.Println(hex.EncodeToString(hashBytes[:]))
 		os.Exit(0)
 	}
 }
