@@ -22,9 +22,10 @@ const nullOperator string = "\x00"
 // Info holds the metadata for a file or directory.
 type Info struct {
 	Size      int      // Size of the file in bytes (0 for directories)
-	FileMode  string   // File permissions and mode
+	FileMode  string   // git object file mode
 	HashBytes [20]byte // Content hash (20 bytes, e.g., SHA-1), initially empty
 	IsDir     bool     // True if it is a directory, false if it is a file
+	FullPath  string   // Full path of the file or directory
 }
 
 // Node represents a single file or directory in the tree.
@@ -48,12 +49,12 @@ type TreeEntry struct {
 // NewTree initializes a new Tree with a root directory.
 func NewTree(srcDir string) *Tree {
 	// The root node is always a directory and has no name in the context of the path.
-	root := NewNode(srcDir, true, 0, "040000", nil)
+	root := NewNode(srcDir, true, 0, "40000", nil, srcDir)
 	return &Tree{Root: root}
 }
 
 // NewNode is a constructor for creating a new Node.
-func NewNode(name string, isDir bool, size int, mode string, parent *Node) *Node {
+func NewNode(name string, isDir bool, size int, mode string, parent *Node, fullPath string) *Node {
 	// Only files should have a non-zero size.
 	if isDir {
 		size = 0
@@ -66,6 +67,7 @@ func NewNode(name string, isDir bool, size int, mode string, parent *Node) *Node
 			FileMode:  mode,
 			HashBytes: [20]byte{}, // Initializes to all zero bytes
 			IsDir:     isDir,
+			FullPath:  fullPath,
 		},
 		Parent:   parent,
 		Children: make(map[string]*Node),
@@ -97,12 +99,43 @@ func gitObjReaderHelper(inputSha string) []byte {
 	return decompressedBytes
 }
 
+func createBlobObjectFromFilePath(filePath string) [20]byte {
+	fileBytes, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading file: %s\n", err)
+		return [20]byte{}
+	}
+	return hashObject("blob", fileBytes)
+}
+
+// getRelativePath returns the path relative to the source directory
+func getRelativePath(sourcePath, fullPath string) (string, error) {
+	relPath, err := filepath.Rel(sourcePath, fullPath)
+	if err != nil {
+		return "", err
+	}
+	if relPath == "." {
+		return "", nil
+	}
+	return relPath, nil
+}
+
 // Insert inserts a new file or directory into the tree based on its full path.
 // It creates any necessary parent directories along the way.
-func (t *Tree) Insert(fullPath string, isDir bool, size int, mode string) (*Node, error) {
-	// Clean the path to handle redundancies like 'a//b' and resolve '.' and '..'
-	// and trim leading/trailing separators so Split works cleanly.
-	cleanedPath := filepath.Clean(fullPath)
+func (t *Tree) Insert(sourcePath, fullPath string, isDir bool, size int, mode string) (*Node, error) {
+	// Get the path relative to the source directory
+	relPath, err := getRelativePath(sourcePath, fullPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get relative path: %w", err)
+	}
+
+	if relPath == "" {
+		// This is the root directory
+		return t.Root, nil
+	}
+
+	// Clean the path to handle redundancies and trim separators
+	cleanedPath := filepath.Clean(relPath)
 	cleanedPath = strings.Trim(cleanedPath, string(os.PathSeparator))
 
 	// Split the path into segments (names)
@@ -133,23 +166,15 @@ func (t *Tree) Insert(fullPath string, isDir bool, size int, mode string) (*Node
 			var newNode *Node
 			if isLastPart {
 				// This is the final file/directory being inserted
-				newNode = NewNode(name, isDir, size, mode, currentNode)
+				newNode = NewNode(name, isDir, size, mode, currentNode, fullPath)
 
-				//Calculate hash for files using the parent directory's path
+				//Calculate hash for files
 				if !isDir {
-					fileBytes, err := os.ReadFile(cleanedPath)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Error reading file: %s\n", err)
-						return nil, err
-					}
-					// Use filepath.Dir to get the parent directory path from the cleaned path
-					newNode.Info.HashBytes = hashObject("blob", fileBytes)
-				} else {
-					newNode.Info.HashBytes = hashObject("tree", []byte{})
+					newNode.Info.HashBytes = createBlobObjectFromFilePath(fullPath)
 				}
 			} else {
 				// Intermediate node must be a directory
-				newNode = NewNode(name, true, 0, mode, currentNode)
+				newNode = NewNode(name, true, 0, "40000", currentNode, fullPath)
 			}
 
 			currentNode.Children[name] = newNode
@@ -164,7 +189,7 @@ func (t *Tree) Insert(fullPath string, isDir bool, size int, mode string) (*Node
 func getGitObjectMode(d fs.DirEntry) (string, error) {
 	// 1. Check for Directory
 	if d.IsDir() {
-		return "040000", nil // Git mode for a tree object (directory)
+		return "40000", nil // Git mode for a tree object (directory)
 	}
 
 	// 2. Check for Symbolic Link
@@ -248,9 +273,10 @@ func lsTree(inputSha string) {
 
 	parts := bytes.Split(contentBytes, []byte(nullOperator))
 	newParts := parts[:len(parts)-1] //removing last sha
-
+	// fmt.Println("newParts: ", newParts)
 	for i := range newParts {
 		splittedEntry := bytes.Split(newParts[i], []byte(" "))
+		// fmt.Printf("splittedEntry: %v\n", splittedEntry)
 		fmt.Println(string(splittedEntry[1]))
 	}
 	os.Exit(0)
@@ -338,80 +364,109 @@ func concatenateTreeEntries(treeEntries []*TreeEntry) ([]byte, error) {
 }
 
 func writeTree(sourceDir string) {
-	tree := NewTree(sourceDir)
-	err := filepath.WalkDir(sourceDir, func(path string, d fs.DirEntry, err error) error {
+	// Get absolute path for source directory
+	absSourceDir, err := filepath.Abs(sourceDir)
+	if err != nil {
+		log.Fatalf("failed to get absolute path: %s", err)
+	}
+
+	tree := NewTree(absSourceDir)
+	err = filepath.WalkDir(absSourceDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
 
 		if d.Name() == ".git" {
 			return filepath.SkipDir
+		}
 
+		fileInfo, err := d.Info()
+		if err != nil {
+			return fmt.Errorf("failed to get file info for %s: %w", path, err)
 		}
-		fileInfo, errr := d.Info()
-		if errr != nil {
-			fmt.Println(errr)
-			return errr
-		}
-		gitObjectMode, errr := getGitObjectMode(d)
-		if errr != nil {
-			fmt.Println(errr)
-			return errr
-		}
-		_, er := tree.Insert(path, d.IsDir(), int(fileInfo.Size()), gitObjectMode)
-		// fmt.Println("node: ", node)
 
-		if er != nil {
-			fmt.Println(er)
-			return er
+		gitObjectMode, err := getGitObjectMode(d)
+		if err != nil {
+			return fmt.Errorf("failed to get git object mode for %s: %w", path, err)
+		}
+
+		_, err = tree.Insert(absSourceDir, path, d.IsDir(), int(fileInfo.Size()), gitObjectMode)
+		if err != nil {
+			return fmt.Errorf("failed to insert %s into tree: %w", path, err)
 		}
 
 		return nil
 	})
 	if err != nil {
-		log.Fatalf("impossible to walk directories: %s", err)
+		log.Fatalf("failed to walk directory: %s", err)
 	}
 
 	listOfNodes := tree.PostOrderTraversal()
-	// fmt.Println("listOfNodes", listOfNodes)
 
 	i := 0
 	for i < len(listOfNodes) {
-
 		currentNode := listOfNodes[i]
 		parentNode := currentNode.Parent
-		j := i
-		var treeEntries []*TreeEntry
-		for j < len(listOfNodes) && currentNode.Parent == listOfNodes[j].Parent && parentNode != nil {
-			treeEntries = append(treeEntries, NewTreeEntry(listOfNodes[j]))
-			j++
-		}
-		childrenNodes := currentNode.Children
-		if parentNode == nil {
-			for _, childNode := range childrenNodes {
-				treeEntries = append(treeEntries, NewTreeEntry(childNode))
-			}
 
-		}
-		// fmt.Println("TreeEntries", treeEntries)
-		sort.Slice(treeEntries, func(i, j int) bool {
-			// This sorts the entries alphabetically by Name
-			return treeEntries[i].Name < treeEntries[j].Name
-		})
-		// create a hashed tree object for the currentNode.parent with treeEntries as the content
-		contentBytes, err := concatenateTreeEntries(treeEntries)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if parentNode != nil {
-			currentNode.Parent.Info.HashBytes = hashObject("tree", contentBytes)
-		}
-
-		i = j
 		if parentNode == nil {
 			break
 		}
 
+		// Collect all siblings of the current node
+		var treeEntries []*TreeEntry
+		j := i
+		for j < len(listOfNodes) && listOfNodes[j].Parent == parentNode {
+			node := listOfNodes[j]
+
+			// Ensure blobs are created for all files
+			if !node.Info.IsDir && node.Info.HashBytes == [20]byte{} {
+				node.Info.HashBytes = createBlobObjectFromFilePath(node.Info.FullPath)
+			}
+
+			treeEntries = append(treeEntries, NewTreeEntry(node))
+			j++
+		}
+
+		// Sort tree entries by name as required by Git
+		sort.Slice(treeEntries, func(i, j int) bool {
+			return treeEntries[i].Name < treeEntries[j].Name
+		})
+
+		// Create tree object for the parent directory
+		contentBytes, err := concatenateTreeEntries(treeEntries)
+		if err != nil {
+			log.Fatalf("failed to concatenate tree entries: %s", err)
+		}
+
+		parentNode.Info.HashBytes = hashObject("tree", contentBytes)
+		i = j
 	}
 
-	fmt.Fprintf(os.Stderr, "%s", hex.EncodeToString(tree.Root.Info.HashBytes[:]))
+	// Process root node last
+	if len(listOfNodes) > 0 {
+		rootNode := tree.Root
+		var rootEntries []*TreeEntry
+
+		// Sort children by name
+		rootEntries = make([]*TreeEntry, 0, len(rootNode.Children))
+		for _, child := range rootNode.Children {
+			rootEntries = append(rootEntries, NewTreeEntry(child))
+		}
+		sort.Slice(rootEntries, func(i, j int) bool {
+			return rootEntries[i].Name < rootEntries[j].Name
+		})
+
+		if len(rootEntries) > 0 {
+			contentBytes, err := concatenateTreeEntries(rootEntries)
+			if err != nil {
+				log.Fatalf("failed to concatenate root tree entries: %s", err)
+			}
+
+			tree.Root.Info.HashBytes = hashObject("tree", contentBytes)
+		}
+	}
+
+	fmt.Fprintf(os.Stdout, "%s", hex.EncodeToString(tree.Root.Info.HashBytes[:]))
 }
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
@@ -455,12 +510,8 @@ func main() {
 			os.Exit(1)
 		}
 
-		fileBytes, err := os.ReadFile(os.Args[3])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading file: %s\n", err)
-			os.Exit(1)
-		}
-		hashObject("blob", fileBytes)
+		hashBytes := createBlobObjectFromFilePath(os.Args[3])
+		fmt.Println(hex.EncodeToString(hashBytes[:]))
 		os.Exit(0)
 	case "ls-tree":
 		lsTree(os.Args[3])
